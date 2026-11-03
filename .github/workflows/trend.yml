@@ -1,7 +1,7 @@
 name: trend-alert
 on:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "7 * * * *"
   workflow_dispatch:
 permissions:
   contents: write
@@ -11,7 +11,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -23,14 +23,17 @@ jobs:
           sudo apt-get install -y fonts-nanum
           fc-cache -f
       - run: pip install numpy pandas requests matplotlib
-      - name: 추세알림 실행
+      - name: 추세알림 반복 실행
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python trend_alert.py
-      - name: 기록 저장
         run: |
           git config user.name "trend-bot"
           git config user.email "trend-bot@users.noreply.github.com"
-          git add state.json || true
-          git diff --cached --quiet || (git commit -m "state" && git pull --rebase && git push)
+          START=$SECONDS
+          while [ $((SECONDS - START)) -lt 20000 ]; do
+            python trend_alert.py || echo "실행 실패"
+            git add state.json || true
+            git diff --cached --quiet || (git commit -m "state" && git pull --rebase --autostash && git push) || true
+            sleep 600
+          done
