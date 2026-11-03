@@ -36,8 +36,7 @@ CFG = {
     "1H": dict(touch=0.003, gap=0.02),
     "15m": dict(touch=0.002, gap=0.01),
 }
-# 성적표(4H/1H/15분)에서 손익분기 40%를 넘긴 것만 켬: (봉, 선, 방향) -> (신호수, 승률%)
-# 일봉은 매번 새로 계산하므로 여기엔 없음 (EMA50 롱만 뺌)
+# 성적표(4H/1H/15분) 승률 표시용: (봉, 선, 방향) -> (신호수, 승률%)  ※ 이제 알림을 거르지는 않음
 SCORE = {
     ("4H", "EMA7", "S"): (7183, 44), ("4H", "EMA20", "S"): (1910, 44),
     ("4H", "EMA50", "S"): (106, 45), ("4H", "VW100", "S"): (328, 44),
@@ -46,7 +45,7 @@ SCORE = {
     ("15m", "EMA50", "S"): (45, 44), ("15m", "VW100", "L"): (127, 46),
     ("15m", "VW100", "S"): (82, 44),
 }
-DAILY_SKIP = {("EMA50", "L")}
+DAILY_SKIP = set()   # 전부 열기
 SMALL_N = 30
 
 names = {f.name for f in font_manager.fontManager.ttflist}
@@ -258,6 +257,69 @@ def draw(df, title, path, only, pl, side):
     plt.close(fig)
 
 
+def draw_card(dfs, sig, pl, side, primary, title, path):
+    """일봉·4시간·1시간·15분을 한 장(2x2)에 그림. 신호난 선은 굵게, 진입·손절·익절은 신호난 봉 칸에만."""
+    from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
+    fig = plt.figure(figsize=(14, 15), dpi=80)
+    outer = GridSpec(2, 2, figure=fig, wspace=0.14, hspace=0.12, top=0.94, bottom=0.03, left=0.06, right=0.97)
+    fig.suptitle(title, fontsize=16, x=0.06, ha="left", color="#2e7d32" if side == "L" else "#c62828")
+    for k, (bar, bn) in enumerate(BARS):
+        gs = GridSpecFromSubplotSpec(4, 1, subplot_spec=outer[k // 2, k % 2],
+                                     height_ratios=[4, 1.2, 1.2, 1.2], hspace=0.08)
+        axp = fig.add_subplot(gs[0])
+        axr = fig.add_subplot(gs[1], sharex=axp)
+        axm = fig.add_subplot(gs[2], sharex=axp)
+        axv = fig.add_subplot(gs[3], sharex=axp)
+        df = dfs.get(bar)
+        if df is None:
+            axp.set_title(f"{bn} (데이터 없음)", fontsize=11, loc="left")
+            continue
+        d = df.iloc[-80:].reset_index(drop=True)
+        x = np.arange(len(d))
+        up = (d["c"] >= d["o"]).values
+        col = np.where(up, "#2e9e44", "#d62728")
+        axp.vlines(x, d["l"], d["h"], colors=col, linewidth=0.8)
+        axp.bar(x, d["c"] - d["o"], bottom=d["o"], color=col, width=0.7)
+        names = sig.get(bar, [])
+        for label, c in LINE_COL.items():
+            if label in names:
+                axp.plot(x, d[c], color=COLORS[label], lw=2.2, label=label)
+            else:
+                axp.plot(x, d[c], color=COLORS[label], lw=0.7, alpha=0.5)
+        mark = "  ★ " + "+".join(names) if names else ""
+        axp.set_title(f"{bn} ({bar}){mark}", fontsize=11, loc="left", fontweight="bold" if names else "normal")
+        if names:
+            axp.legend(loc="upper left", fontsize=8)
+        if bar == primary and pl:
+            entry, sl, tp = pl
+            for v, name, color in ((tp, "TP", "#2e7d32"), (entry, "IN", "#000000"), (sl, "SL", "#c62828")):
+                axp.axhline(v, color=color, ls="--", lw=1)
+                axp.annotate(f" {name} {fmt(v)}", xy=(1.0, v), xycoords=("axes fraction", "data"),
+                             color=color, fontsize=7, va="center", ha="left")
+        for n, color in ((6, "#8e44ad"), (12, "#1e88e5"), (24, "#fb8c00")):
+            axr.plot(x, d[f"rsi{n}"], color=color, lw=0.8)
+        axr.axhline(70, color="gray", ls="--", lw=0.5)
+        axr.axhline(30, color="gray", ls="--", lw=0.5)
+        axr.set_ylim(0, 100)
+        axr.set_yticks([30, 70])
+        axm.bar(x, d["hist"], color=np.where(d["hist"] >= 0, "#2e9e44", "#d62728"), width=0.7)
+        axm.plot(x, d["macd"], color="#1e88e5", lw=0.8)
+        axm.plot(x, d["sig"], color="#fb8c00", lw=0.8)
+        axv.bar(x, d["turn"], color=col, width=0.7)
+        for ax, lab in ((axr, "RSI"), (axm, "MACD"), (axv, "VOL")):
+            ax.set_ylabel(lab, fontsize=7)
+            ax.tick_params(labelsize=7)
+        axp.tick_params(labelsize=8)
+        axv.set_yticks([])
+        for ax in (axp, axr, axm):
+            plt.setp(ax.get_xticklabels(), visible=False)
+        axv.set_xticks([])
+        for ax in (axp, axr, axm, axv):
+            ax.grid(alpha=0.25)
+    fig.savefig(path)
+    plt.close(fig)
+
+
 def send_photo(path, caption):
     if not TOKEN or not CHAT:
         print("텔레그램 설정 없음:", caption)
@@ -277,10 +339,13 @@ def send_text(text):
 
 
 def rate_text(bar, name, side, daily):
-    if bar == "1D":
-        n, wr, _ = daily[(name, side)]
-    else:
-        n, wr = SCORE[(bar, name, side)]
+    try:
+        if bar == "1D":
+            n, wr, _ = daily[(name, side)]
+        else:
+            n, wr = SCORE[(bar, name, side)]
+    except Exception:
+        return f"{name} 성적표 없음"
     tag = f"{name} {wr:.0f}%({n}번)"
     return tag + (" 표본적음" if n < SMALL_N else "")
 
@@ -337,10 +402,8 @@ def main():
             if not s:
                 continue
             if bar == "1D":
-                if (name, s) in DAILY_SKIP or daily is None:
+                if (name, s) in DAILY_SKIP:
                     continue
-            elif (bar, name, s) not in SCORE:
-                continue
             key = f"{inst}|{bar}|{s}"
             if ts - state.get(key, 0) < COOLDOWN_BARS * PERIOD[bar]:
                 continue
@@ -375,10 +438,19 @@ def main():
         bn = dict(BARS)[bar]
         side = "롱" if s == "L" else "숏"
         try:
-            t1d = trend_of(add_ind(get_candles(inst, "1D")))
-            t4h = trend_of(add_ind(get_candles(inst, "4H")))
-            title = f"[{bn}] {coin} {side}진입 · {'+'.join(names_)} 추세"
-            draw(ind, title, "chart.png", names_, pl, s)
+            dfs = {}
+            for b2, _ in BARS:
+                if b2 in by_bar:
+                    dfs[b2] = by_bar[b2]["ind"]
+                else:
+                    g = get_candles(inst, b2)
+                    dfs[b2] = add_ind(g) if g is not None else None
+                    time.sleep(0.1)
+            t1d = trend_of(dfs.get("1D"))
+            t4h = trend_of(dfs.get("4H"))
+            title = f"{coin} {side}진입  [{bn}] {'+'.join(names_)} 추세"
+            sig = {b2: by_bar[b2]["names"] for b2 in bars}
+            draw_card(dfs, sig, pl, s, bar, title, "chart.png")
             entry, sl, tp = pl
             extra = ""
             if len(bars) > 1:
