@@ -1,0 +1,408 @@
+import os
+import json
+import time
+import numpy as np
+import pandas as pd
+import requests
+from concurrent.futures import ThreadPoolExecutor
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib import font_manager
+import main as m   # 일봉 성적표 계산(backtest)과 손절·익절 기준을 가져다 씀
+
+TOKEN = os.environ.get("TELEGRAM_TOKEN")
+CHAT = os.environ.get("TELEGRAM_CHAT_ID")
+BASE = "https://www.okx.com"
+STATE = "state.json"
+
+# ===== 설정 (여기 숫자만 바꾸면 됨) =====
+TOP_N = 60            # 거래대금 상위 몇 개 코인을 볼지
+SHOW = 120            # 차트에 보여줄 봉 개수
+SLOPE_BARS = 5        # 선의 방향을 볼 봉 개수
+SLOPE_ATR = 0.3       # (1시간 이하·4시간봉) 선이 ATR의 0.3배 이상 움직여야 '방향 있음'
+COOLDOWN_BARS = 3     # 같은 코인·봉·방향은 3봉 안에 또 알리지 않음
+MAX_ALERTS = 15       # 한 번에 보낼 최대 알림 수
+WORKERS = 4
+BREAK_EVEN = 40       # 손익분기 승률(%)
+BARS = [("1D", "일봉"), ("4H", "4시간봉"), ("1H", "1시간봉"), ("15m", "15분봉")]
+PERIOD = {"1D": 86400000, "4H": 14400000, "1H": 3600000, "15m": 900000}
+# 봉이 막 끝난 뒤 이 시간 안에 돌았을 때만 그 봉을 봄 (GitHub 실행이 늦어도 놓치지 않게 넉넉히)
+WINDOW = {"1D": 4 * 3600000, "4H": 3 * 3600000, "1H": 75 * 60000, "15m": 35 * 60000}
+# 봉마다: 선에 닿은 거리(touch), 이격 큼 기준(gap), 신호 후 기다리는 봉 수(hold)
+CFG = {
+    "1D": dict(touch=0.005, gap=0.04),
+    "4H": dict(touch=0.004, gap=0.03),
+    "1H": dict(touch=0.003, gap=0.02),
+    "15m": dict(touch=0.002, gap=0.01),
+}
+# 성적표(4H/1H/15분)에서 손익분기 40%를 넘긴 것만 켬: (봉, 선, 방향) -> (신호수, 승률%)
+# 일봉은 매번 새로 계산하므로 여기엔 없음 (EMA50 롱만 뺌)
+SCORE = {
+    ("4H", "EMA7", "S"): (7183, 44), ("4H", "EMA20", "S"): (1910, 44),
+    ("4H", "EMA50", "S"): (106, 45), ("4H", "VW100", "S"): (328, 44),
+    ("1H", "EMA7", "S"): (5921, 44), ("1H", "EMA50", "S"): (55, 47),
+    ("1H", "VW100", "S"): (205, 42),
+    ("15m", "EMA50", "S"): (45, 44), ("15m", "VW100", "L"): (127, 46),
+    ("15m", "VW100", "S"): (82, 44),
+}
+DAILY_SKIP = {("EMA50", "L")}
+SMALL_N = 30
+
+names = {f.name for f in font_manager.fontManager.ttflist}
+for n in ["NanumGothic", "Malgun Gothic", "AppleGothic"]:
+    if n in names:
+        plt.rcParams["font.family"] = n
+        break
+plt.rcParams["axes.unicode_minus"] = False
+
+COLORS = {"EMA7": "#d81b60", "EMA20": "#f9a825", "EMA50": "#2e7d32",
+          "EMA120": "#757575", "EMA200": "#e53935", "VW100": "#6a1b9a"}
+LINE_COL = {"EMA7": "ema7", "EMA20": "ema20", "EMA50": "ema50",
+            "EMA120": "ema120", "EMA200": "ema200", "VW100": "vw100"}
+
+
+# ---------------- 데이터 ----------------
+def num(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def get_candles(inst, bar, hist=0):
+    """마감된 봉만. hist>0이면 그만큼(봉 수) 과거까지 이어서 받음"""
+    rows, after = [], None
+    while True:
+        if after:
+            url, p = "/api/v5/market/history-candles", {"instId": inst, "bar": bar, "limit": "100", "after": after}
+        else:
+            url, p = "/api/v5/market/candles", {"instId": inst, "bar": bar, "limit": "300"}
+        data = []
+        for _ in range(3):
+            try:
+                r = requests.get(BASE + url, params=p, timeout=15).json()
+                if r.get("code") == "0" and r["data"]:
+                    data = r["data"]
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        if not data:
+            break
+        rows += data
+        after = data[-1][0]
+        if not hist or len(rows) >= hist:
+            break
+        time.sleep(0.15)
+    if not rows:
+        return None
+    df = pd.DataFrame(rows).iloc[:, :9]
+    df.columns = ["ts", "o", "h", "l", "c", "vol", "volc", "turn", "confirm"]
+    for k in df.columns:
+        df[k] = df[k].astype(float)
+    df = df.drop_duplicates("ts").sort_values("ts").reset_index(drop=True)
+    df = df[df["confirm"] == 1].reset_index(drop=True)
+    if len(df) < 120:
+        return None
+    if df["turn"].sum() == 0:
+        df["turn"] = df["volc"] * df["c"]
+    return df
+
+
+def ema(s, n):
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def rsi(s, n):
+    d = s.diff()
+    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
+    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
+    return 100 - 100 / (1 + up / dn)
+
+
+def add_ind(df):
+    for n in (7, 20, 50, 120, 200):
+        df[f"ema{n}"] = ema(df["c"], n)
+    vs = df["volc"].rolling(100).sum()
+    df["vw100"] = (df["c"] * df["volc"]).rolling(100).sum() / vs.where(vs > 0)
+    for n in (6, 12, 24):
+        df[f"rsi{n}"] = rsi(df["c"], n)
+    df["macd"] = ema(df["c"], 12) - ema(df["c"], 26)
+    df["sig"] = df["macd"].ewm(span=9, adjust=False).mean()
+    df["hist"] = df["macd"] - df["sig"]
+    pc = df["c"].shift(1)
+    tr = pd.concat([df["h"] - df["l"], (df["h"] - pc).abs(), (df["l"] - pc).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(14).mean()
+    return df
+
+
+def trend_of(df):
+    if df is None or len(df) < 60:
+        return None
+    last = df.iloc[-1]
+    if last["c"] > last["ema50"] and last["ema20"] > last["ema50"]:
+        return "up"
+    if last["c"] < last["ema50"] and last["ema20"] < last["ema50"]:
+        return "down"
+    return None
+
+
+def arrow(t):
+    return {"up": "↑", "down": "↓"}.get(t, "↔")
+
+
+# ---------------- 신호 ----------------
+def signal(df, col, bar):
+    """마지막(마감) 봉에 롱/숏 신호가 있는지. 'L' / 'S' / None"""
+    i = len(df) - 1
+    o, h, l, c = df["o"].iloc[i], df["h"].iloc[i], df["l"].iloc[i], df["c"].iloc[i]
+    now, before, a = df[col].iloc[i], df[col].iloc[i - SLOPE_BARS], df["atr"].iloc[i]
+    if pd.isna(now) or pd.isna(before) or pd.isna(a):
+        return None
+    cfg = CFG[bar]
+    gap = c / now - 1
+    if bar == "1D":      # 일봉은 성적표와 같은 규칙(선이 5일에 0.2% 이상 기울어야 함)
+        up = now / before - 1 >= m.SLOPE_MIN
+        dn = now / before - 1 <= -m.SLOPE_MIN
+    else:
+        up = now - before >= SLOPE_ATR * a
+        dn = now - before <= -SLOPE_ATR * a
+    if up and 0 < gap <= cfg["gap"] and l <= now * (1 + cfg["touch"]) and c > o:
+        return "L"
+    if dn and -cfg["gap"] <= gap < 0 and h >= now * (1 - cfg["touch"]) and c < o:
+        return "S"
+    return None
+
+
+def plan(df, side):
+    entry, a = df["c"].iloc[-1], df["atr"].iloc[-1]
+    risk = min(m.ATR_MULT * a / entry, m.MAX_STOP)
+    if risk * m.RR < m.MIN_TP:
+        return None
+    if side == "L":
+        return entry, entry * (1 - risk), entry * (1 + risk * m.RR)
+    return entry, entry * (1 + risk), entry * (1 - risk * m.RR)
+
+
+def surge_ratio(df):
+    base = df["turn"].iloc[-21:-1].mean()
+    return df["turn"].iloc[-1] / base if base > 0 else 0
+
+
+def last_close(bar, now_ms):
+    p = PERIOD[bar]
+    off = 16 * 3600000 if bar == "1D" else 0     # OKX 일봉은 한국시간 오전 1시에 마감
+    return ((now_ms - off) // p) * p + off
+
+
+# ---------------- 그림·글 ----------------
+def fmt(v):
+    if v >= 100:
+        return f"{v:,.2f}"
+    if v >= 1:
+        return f"{v:.4f}"
+    return f"{v:.7f}"
+
+
+def um(v):
+    if v >= 1e8:
+        return f"{v / 1e8:,.1f}억"
+    if v >= 1e4:
+        return f"{v / 1e4:,.1f}만"
+    return f"{v:,.0f}"
+
+
+def draw(df, title, path, only, pl, side):
+    d = df.iloc[-SHOW:].reset_index(drop=True)
+    x = np.arange(len(d))
+    fig, ax = plt.subplots(4, 1, figsize=(9, 11), sharex=True,
+                           gridspec_kw={"height_ratios": [5, 1.5, 1.5, 1.5]})
+    p = ax[0]
+    for i, r in d.iterrows():
+        col = "#2e9e44" if r["c"] >= r["o"] else "#d62728"
+        p.vlines(i, r["l"], r["h"], color=col, lw=0.8)
+        p.bar(i, abs(r["c"] - r["o"]), bottom=min(r["o"], r["c"]), color=col, width=0.7)
+    for label, c in LINE_COL.items():
+        if label in only:
+            p.plot(x, d[c], color=COLORS[label], lw=2.2, label=label)
+    entry, sl, tp = pl
+    for v, name, color in ((tp, "익절", "#2e7d32"), (entry, "진입", "#000000"), (sl, "손절", "#c62828")):
+        p.axhline(v, color=color, ls="--", lw=1.2)
+        p.annotate(f" {name} {fmt(v)}", xy=(1.0, v), xycoords=("axes fraction", "data"),
+                   color=color, fontsize=9, va="center", ha="left")
+    p.legend(loc="upper left", fontsize=10)
+    p.set_title(title, fontsize=14, color="#2e7d32" if side == "L" else "#c62828")
+    p.grid(alpha=0.25)
+    for n, color in ((6, "#8e44ad"), (12, "#1e88e5"), (24, "#fb8c00")):
+        ax[1].plot(x, d[f"rsi{n}"], color=color, lw=1, label=f"RSI{n}")
+    ax[1].axhline(70, color="gray", ls="--", lw=0.6)
+    ax[1].axhline(30, color="gray", ls="--", lw=0.6)
+    ax[1].legend(loc="upper left", fontsize=7, ncol=3)
+    ax[1].grid(alpha=0.25)
+    ax[2].bar(x, d["hist"], color=np.where(d["hist"] >= 0, "#2e9e44", "#d62728"), width=0.7)
+    ax[2].plot(x, d["macd"], color="#1e88e5", lw=1, label="MACD")
+    ax[2].plot(x, d["sig"], color="#fb8c00", lw=1, label="Signal")
+    ax[2].legend(loc="upper left", fontsize=7, ncol=2)
+    ax[2].grid(alpha=0.25)
+    ax[3].bar(x, d["turn"], color=np.where(d["c"] >= d["o"], "#2e9e44", "#d62728"), width=0.7)
+    ax[3].set_ylabel("거래대금($)", fontsize=8)
+    ax[3].grid(alpha=0.25)
+    ticks = list(range(0, len(d), 20))
+    t = pd.to_datetime(d["ts"], unit="ms") + pd.Timedelta(hours=9)
+    ax[3].set_xticks(ticks)
+    ax[3].set_xticklabels([t[i].strftime("%m-%d %H:%M") for i in ticks], fontsize=8)
+    fig.tight_layout()
+    fig.subplots_adjust(right=0.85)
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
+def send_photo(path, caption):
+    if not TOKEN or not CHAT:
+        print("텔레그램 설정 없음:", caption)
+        return
+    with open(path, "rb") as fh:
+        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                      data={"chat_id": CHAT, "caption": caption[:1000]},
+                      files={"photo": fh}, timeout=30)
+
+
+def send_text(text):
+    if not TOKEN or not CHAT:
+        print("텔레그램 설정 없음:", text)
+        return
+    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                  data={"chat_id": CHAT, "text": text}, timeout=30)
+
+
+def rate_text(bar, name, side, daily):
+    if bar == "1D":
+        n, wr, _ = daily[(name, side)]
+    else:
+        n, wr = SCORE[(bar, name, side)]
+    tag = f"{name} {wr:.0f}%({n}번)"
+    return tag + (" 표본적음" if n < SMALL_N else "")
+
+
+# ---------------- 실행 ----------------
+def scan_coin(args):
+    inst, bar, now_ms = args
+    try:
+        df = get_candles(inst, bar, hist=400 if bar == "1D" else 0)
+        time.sleep(0.1)
+        if df is None or df["ts"].iloc[-1] + PERIOD[bar] != last_close(bar, now_ms):
+            return inst, bar, None, None     # 아직 마감 확정 전이거나 데이터 부족
+        return inst, bar, add_ind(df), df
+    except Exception as e:
+        print(inst, bar, "error:", e)
+        return inst, bar, None, None
+
+
+def main():
+    state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+    now_ms = int(time.time() * 1000)
+    state = {k: v for k, v in state.items() if now_ms - v < 3 * 86400000}
+    fresh = [b for b, _ in BARS if now_ms - last_close(b, now_ms) <= WINDOW[b]]
+    print("지금 볼 봉:", fresh)
+    if not fresh:
+        json.dump(state, open(STATE, "w"))
+        return
+    tk = requests.get(BASE + "/api/v5/market/tickers", params={"instType": "SWAP"},
+                      timeout=15).json()["data"]
+    tk = [t for t in tk if t["instId"].endswith("-USDT-SWAP")]
+    vol24 = {t["instId"]: num(t.get("volCcy24h")) * num(t.get("last")) for t in tk}
+    top = sorted(vol24, key=vol24.get, reverse=True)[:TOP_N]
+    jobs = [(inst, bar, now_ms) for bar in fresh for inst in top]
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        res = list(ex.map(scan_coin, jobs))
+    # 일봉이면 성적표를 새로 계산
+    daily = None
+    if "1D" in fresh:
+        all_res = []
+        for inst, bar, ind, raw in res:
+            if bar == "1D" and raw is not None:
+                d = {k: raw[k].values for k in ("o", "h", "l", "c")}
+                d["v"] = raw["volc"].values
+                all_res += m.backtest(d)
+        daily = m.summarize(all_res)
+    cands = {}      # (코인, 방향) -> 신호 목록
+    for inst, bar, ind, raw in res:
+        if ind is None:
+            continue
+        ts = int(ind["ts"].iloc[-1])
+        pl_cache = {}
+        for name, col in LINE_COL.items():
+            s = signal(ind, col, bar)
+            if not s:
+                continue
+            if bar == "1D":
+                if (name, s) in DAILY_SKIP or daily is None:
+                    continue
+            elif (bar, name, s) not in SCORE:
+                continue
+            key = f"{inst}|{bar}|{s}"
+            if ts - state.get(key, 0) < COOLDOWN_BARS * PERIOD[bar]:
+                continue
+            pl_cache.setdefault(s, plan(ind, s))
+            if pl_cache[s] is None:
+                continue
+            cands.setdefault((inst, s), {}).setdefault(bar, {"ind": ind, "ts": ts, "names": [], "key": key})
+            cands[(inst, s)][bar]["names"].append(name)
+    print("새 신호 코인:", len(cands))
+    if not cands:
+        json.dump(state, open(STATE, "w"))
+        return
+    # 시장·큰 흐름
+    btc = None
+    try:
+        btc = trend_of(add_ind(get_candles("BTC-USDT-SWAP", "1D")))
+    except Exception as e:
+        print("btc error:", e)
+    order = {b: i for i, (b, _) in enumerate(BARS)}
+    sent = 0
+    for (inst, s), by_bar in cands.items():
+        bars = sorted(by_bar, key=lambda b: order[b])
+        for b in bars:
+            state[by_bar[b]["key"]] = by_bar[b]["ts"]
+        if sent >= MAX_ALERTS:
+            continue
+        bar = bars[0]
+        c = by_bar[bar]
+        ind, names_ = c["ind"], c["names"]
+        pl = plan(ind, s)
+        coin = inst.replace("-USDT-SWAP", "")
+        bn = dict(BARS)[bar]
+        side = "롱" if s == "L" else "숏"
+        try:
+            t1d = trend_of(add_ind(get_candles(inst, "1D")))
+            t4h = trend_of(add_ind(get_candles(inst, "4H")))
+            title = f"[{bn}] {coin} {side}진입 · {'+'.join(names_)} 추세"
+            draw(ind, title, "chart.png", names_, pl, s)
+            entry, sl, tp = pl
+            extra = ""
+            if len(bars) > 1:
+                extra = "겹침: " + " / ".join(f"{dict(BARS)[b]} {'+'.join(by_bar[b]['names'])}" for b in bars) + "\n"
+            rates = ", ".join(rate_text(bar, n, s, daily) for n in names_)
+            cap = (f"[{bn}] {side}진입 · {coin} · {'+'.join(names_)} 추세\n"
+                   f"진입가: {fmt(entry)}\n"
+                   f"손절가: {fmt(sl)} ({(sl / entry - 1) * 100:+.2f}%)\n"
+                   f"익절가: {fmt(tp)} ({(tp / entry - 1) * 100:+.2f}%)\n"
+                   f"과거 승률: {rates} (손익분기 {BREAK_EVEN}%)\n"
+                   f"큰 흐름: 일봉{arrow(t1d)} · 4시간{arrow(t4h)}\n"
+                   f"시장(비트코인 일봉): {arrow(btc)}\n"
+                   f"{extra}"
+                   f"거래대금: 평균의 {surge_ratio(ind):.1f}배 ({bn})\n"
+                   f"봉 거래대금: ${um(ind['turn'].iloc[-1])}\n"
+                   f"24시간 거래대금: ${um(vol24.get(inst, 0))}")
+            send_photo("chart.png", cap)
+            sent += 1
+        except Exception as e:
+            print(inst, "alert error:", e)
+    if len(cands) > MAX_ALERTS:
+        send_text(f"추세알림: 신호가 많아 {MAX_ALERTS}개만 보냈어요 (전체 {len(cands)}개)")
+    json.dump(state, open(STATE, "w"))
+
+
+if __name__ == "__main__":
+    main()
