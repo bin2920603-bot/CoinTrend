@@ -23,8 +23,16 @@ SLOPE_BARS = 5        # 선의 방향을 볼 봉 개수
 SLOPE_ATR = 0.3       # (1시간 이하·4시간봉) 선이 ATR의 0.3배 이상 움직여야 '방향 있음'
 COOLDOWN_BARS = 3     # 같은 코인·봉·방향은 3봉 안에 또 알리지 않음
 MAX_ALERTS = 60       # 한 번에 보낼 최대 알림 수
+SEND_GAP = 3.2        # 알림 사진을 보낼 때마다 쉬는 시간(초). 텔레그램은 방 하나에 1분에 20개쯤이 한도
 WORKERS = 4
 BREAK_EVEN = 40       # 손익분기 승률(%)
+CARD_BARS = 120       # 카드(4칸 사진) 한 칸에 보여줄 봉 개수
+TREND_EXT = 20        # 추세선을 오른쪽으로 몇 봉만큼 더 늘려 그릴지
+TREND_K = 2           # 추세선 고점/저점 판단: 좌우 몇 봉보다 높아야(낮아야) 고점(저점)으로 볼지
+TREND_TOL = 0.03      # 추세선 여유: 차트 높이의 3%까지는 꼬리가 선을 넘어도 봐줌
+TREND_BAD = 1         # 선을 넘은 봉이 이 개수 이하면 인정
+TREND_MIN_GAP = 8     # 선을 긋는 두 점 사이가 최소 몇 봉 이상 떨어져야 하는지
+TREND_COLOR = "#FFC107"   # 추세선 색 (노란색)
 BARS = [("1D", "일봉"), ("4H", "4시간봉"), ("1H", "1시간봉"), ("15m", "15분봉")]
 PERIOD = {"1D": 86400000, "4H": 14400000, "1H": 3600000, "15m": 900000}
 # 봉이 막 끝난 뒤 이 시간 안에 돌았을 때만 그 봉을 봄 (GitHub 실행이 늦어도 놓치지 않게 넉넉히)
@@ -195,6 +203,72 @@ def last_close(bar, now_ms):
     return ((now_ms - off) // p) * p + off
 
 
+# ---------------- 추세선 (노란색) ----------------
+def find_swings(vals, k, high=True):
+    """좌우 k봉보다 높은(낮은) 봉의 위치 목록 = 고점(저점)"""
+    out = []
+    for i in range(k, len(vals) - k):
+        window = vals[i - k:i + k + 1]
+        if (high and vals[i] == max(window)) or ((not high) and vals[i] == min(window)):
+            out.append(i)
+    return out
+
+
+def find_trendline(d, kind):
+    """kind='down': 고점들을 이은 하락 추세선, kind='up': 저점들을 이은 상승 추세선.
+    꼬리가 선을 살짝 넘는 건 봐주고, 넘은 봉이 TREND_BAD개 이하인 선 중 가장 길게 이어진 선을 고름.
+    돌려주는 값: (시작 위치, 시작 가격, 끝 위치, 끝 가격) 또는 None"""
+    n = len(d)
+    highs = list(d["h"].values)
+    lows = list(d["l"].values)
+    tol = TREND_TOL * (max(highs) - min(lows))
+    if kind == "down":
+        vals = highs
+        swings = find_swings(vals, TREND_K, True)
+    else:
+        vals = lows
+        swings = find_swings(vals, TREND_K, False)
+    best = None
+    for b in swings[-4:]:
+        for a in swings:
+            if b - a < TREND_MIN_GAP:
+                break
+            if kind == "down" and vals[a] <= vals[b]:
+                continue
+            if kind == "up" and vals[a] >= vals[b]:
+                continue
+            slope = (vals[b] - vals[a]) / (b - a)
+            bad = 0
+            for x in range(a, n - 1):
+                line = vals[a] + slope * (x - a)
+                if kind == "down" and vals[x] > line + tol:
+                    bad += 1
+                if kind == "up" and vals[x] < line - tol:
+                    bad += 1
+            if bad > TREND_BAD:
+                continue
+            span = b - a
+            if best is None or span > best[0]:
+                best = (span, a, vals[a], n - 1, vals[a] + slope * (n - 1 - a))
+    return best[1:] if best else None
+
+
+def draw_trendlines(ax, d):
+    """가격 차트에 노란 추세선(하락선·상승선)을 그림. 선은 오른쪽으로 TREND_EXT봉만큼 더 늘려 그림"""
+    first = True
+    n = len(d)
+    for kind in ("down", "up"):
+        t = find_trendline(d, kind)
+        if t:
+            x0, y0, x1, y1 = t
+            slope = (y1 - y0) / (x1 - x0) if x1 != x0 else 0
+            x_end = n - 1 + TREND_EXT
+            y_end = y0 + slope * (x_end - x0)
+            ax.plot([x0, x_end], [y0, y_end], color=TREND_COLOR, linewidth=3.0,
+                    label="추세선" if first else None)
+            first = False
+
+
 # ---------------- 그림·글 ----------------
 def fmt(v):
     if v >= 100:
@@ -274,7 +348,7 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
         if df is None:
             axp.set_title(f"{bn} (데이터 없음)", fontsize=11, loc="left")
             continue
-        d = df.iloc[-80:].reset_index(drop=True)
+        d = df.iloc[-CARD_BARS:].reset_index(drop=True)
         x = np.arange(len(d))
         up = (d["c"] >= d["o"]).values
         col = np.where(up, "#2e9e44", "#d62728")
@@ -286,6 +360,11 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
                 axp.plot(x, d[c], color=COLORS[label], lw=2.2, label=label)
             else:
                 axp.plot(x, d[c], color=COLORS[label], lw=0.7, alpha=0.5)
+        # 노란 추세선 (선이 멀리 뻗어도 가격 범위는 그대로 유지, 오른쪽에 빈 공간을 만들어 선을 연장)
+        y_lo, y_hi = axp.get_ylim()
+        draw_trendlines(axp, d)
+        axp.set_ylim(y_lo, y_hi)
+        axp.set_xlim(-1, len(d) + TREND_EXT)
         mark = "  ★ " + "+".join(names) if names else ""
         axp.set_title(f"{bn} ({bar}){mark}", fontsize=11, loc="left", fontweight="bold" if names else "normal")
         if names:
@@ -320,22 +399,49 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
     plt.close(fig)
 
 
+# ---------------- 텔레그램 보내기 ----------------
 def send_photo(path, caption):
+    """사진을 보내고, 성공하면 True. 텔레그램이 거절하면 이유를 기록에 남기고, '너무 빨라요(429)'면 기다렸다가 다시 보냄"""
     if not TOKEN or not CHAT:
         print("텔레그램 설정 없음:", caption)
-        return
-    with open(path, "rb") as fh:
-        requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
-                      data={"chat_id": CHAT, "caption": caption[:1000]},
-                      files={"photo": fh}, timeout=30)
+        return False
+    for _ in range(3):
+        try:
+            with open(path, "rb") as fh:
+                r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendPhoto",
+                                  data={"chat_id": CHAT, "caption": caption[:1000]},
+                                  files={"photo": fh}, timeout=30)
+        except Exception as e:
+            print("[텔레그램 전송 오류]", e)
+            return False
+        if r.ok:
+            return True
+        print("[텔레그램 실패]", r.status_code, r.text[:200])
+        if r.status_code == 429:
+            wait = 5
+            try:
+                wait = r.json()["parameters"]["retry_after"]
+            except Exception:
+                pass
+            time.sleep(min(wait, 60) + 1)
+            continue
+        return False
+    return False
 
 
 def send_text(text):
     if not TOKEN or not CHAT:
         print("텔레그램 설정 없음:", text)
-        return
-    requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                  data={"chat_id": CHAT, "text": text}, timeout=30)
+        return False
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
+                          data={"chat_id": CHAT, "text": text}, timeout=30)
+        if not r.ok:
+            print("[텔레그램 실패]", r.status_code, r.text[:200])
+        return r.ok
+    except Exception as e:
+        print("[텔레그램 전송 오류]", e)
+        return False
 
 
 def rate_text(bar, name, side, daily):
@@ -424,6 +530,7 @@ def main():
         print("btc error:", e)
     order = {b: i for i, (b, _) in enumerate(BARS)}
     sent = 0
+    ok_count = 0
     for (inst, s), by_bar in cands.items():
         bars = sorted(by_bar, key=lambda b: order[b])
         for b in bars:
@@ -467,10 +574,13 @@ def main():
                    f"거래대금: 평균의 {surge_ratio(ind):.1f}배 ({bn})\n"
                    f"봉 거래대금: ${um(ind['turn'].iloc[-1])}\n"
                    f"24시간 거래대금: ${um(vol24.get(inst, 0))}")
-            send_photo("chart.png", cap)
+            if send_photo("chart.png", cap):
+                ok_count += 1
             sent += 1
+            time.sleep(SEND_GAP)      # 텔레그램 '너무 빨라요' 방지
         except Exception as e:
             print(inst, "alert error:", e)
+    print(f"알림 보내기 시도 {sent}개, 성공 {ok_count}개")
     if len(cands) > MAX_ALERTS:
         send_text(f"추세알림: 신호가 많아 {MAX_ALERTS}개만 보냈어요 (전체 {len(cands)}개)")
     json.dump(state, open(STATE, "w"))
