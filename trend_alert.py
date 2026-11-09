@@ -331,6 +331,39 @@ def draw(df, title, path, only, pl, side):
     plt.close(fig)
 
 
+def draw_day_marks(axp, others, d, bn):
+    """오늘 시가·고가·저가·현재가(연한 회색 점선+작은 글자) + 1시간봉·15분봉에는 매일 01시 마감 세로선"""
+    grey, txt = "#90a4ae", "#607d8b"
+    H = 3600000
+    last = int(d["ts"].iloc[-1])
+    start = (last + 8 * H) // (24 * H) * (24 * H) - 8 * H
+    today = d[d["ts"] >= start]
+    if len(today):
+        vals = {"시가": float(today["o"].iloc[0]), "고가": float(today["h"].max()),
+                "저가": float(today["l"].min()), "현재가": float(d["c"].iloc[-1])}
+        items = sorted(vals.items(), key=lambda t: -t[1])
+        y0, y1 = axp.get_ylim()
+        gap = (y1 - y0) * 0.07
+        pos = []
+        for _, v in items:
+            axp.axhline(v, color=grey, lw=0.9, ls="--", alpha=0.8)
+            pos.append(v if not pos else min(v, pos[-1] - gap))
+        n = len(d)
+        for (name, v), y in zip(items, pos):
+            axp.annotate(f"{name} {fmt(v)}", xy=(n + 1, v), xytext=(n + 2, y), xycoords="data", textcoords="data",
+                         fontsize=6.5, color=txt, va="center", ha="left", fontweight="bold", annotation_clip=False,
+                         arrowprops=dict(arrowstyle="-", color=grey, lw=0.6, shrinkA=0, shrinkB=0))
+    if bn in ("1시간봉", "15분봉"):
+        kst = pd.to_datetime(d["ts"], unit="ms") + pd.Timedelta(hours=9)
+        for i in range(1, len(d)):
+            if kst[i].hour == 1 and kst[i].minute == 0:
+                for a in [axp] + others:
+                    a.axvline(i - 0.5, color=grey, lw=1.0, ls=(0, (2, 2)), alpha=0.9)
+                if i >= 14:
+                    axp.text(i - 0.5, 1.0, "01시 마감", transform=axp.get_xaxis_transform(), fontsize=7,
+                             color=txt, ha="center", va="bottom", fontweight="bold")
+
+
 def draw_card(dfs, sig, pl, side, primary, title, path):
     """일봉·4시간·1시간·15분을 한 장(2x2)에 그림. 신호난 선은 굵게, 진입·손절·익절은 신호난 봉 칸에만."""
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
@@ -365,6 +398,7 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
         draw_trendlines(axp, d)
         axp.set_ylim(y_lo, y_hi)
         axp.set_xlim(-1, len(d) + TREND_EXT)
+        draw_day_marks(axp, [axr, axm, axv], d, bn)
         mark = "  ★ " + "+".join(names) if names else ""
         axp.set_title(f"{bn} ({bar}){mark}", fontsize=11, loc="left", fontweight="bold" if names else "normal")
         if names:
