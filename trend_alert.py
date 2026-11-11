@@ -33,6 +33,12 @@ TREND_TOL = 0.03      # 추세선 여유: 차트 높이의 3%까지는 꼬리가
 TREND_BAD = 1         # 선을 넘은 봉이 이 개수 이하면 인정
 TREND_MIN_GAP = 8     # 선을 긋는 두 점 사이가 최소 몇 봉 이상 떨어져야 하는지
 TREND_COLOR = "#FFC107"   # 추세선 색 (노란색)
+# ---- 새 모양 (거래대금30·전체 일봉과 같은 표시) ----
+ZPIVOT = 5            # 지지·저항 박스: 앞뒤 5봉보다 높(낮)으면 고점(저점)
+ZONE_PCT = 0.015      # 가격이 이 비율 안에 모이면 같은 박스로 묶음
+SHIFT = 26            # 일목 구름이 앞으로 나가는 봉 수
+RSI_LOW = 30          # RSI 이 값 이하면 과매도 ▲
+RSI_HIGH = 70         # RSI 이 값 이상이면 과매수 ▼
 BARS = [("1D", "일봉"), ("4H", "4시간봉"), ("1H", "1시간봉"), ("15m", "15분봉")]
 PERIOD = {"1D": 86400000, "4H": 14400000, "1H": 3600000, "15m": 900000}
 # 봉이 막 끝난 뒤 이 시간 안에 돌았을 때만 그 봉을 봄 (GitHub 실행이 늦어도 놓치지 않게 넉넉히)
@@ -133,7 +139,7 @@ def add_ind(df):
         df[f"ema{n}"] = ema(df["c"], n)
     vs = df["volc"].rolling(100).sum()
     df["vw100"] = (df["c"] * df["volc"]).rolling(100).sum() / vs.where(vs > 0)
-    for n in (6, 12, 24):
+    for n in (6, 12, 14, 24):
         df[f"rsi{n}"] = rsi(df["c"], n)
     df["macd"] = ema(df["c"], 12) - ema(df["c"], 26)
     df["sig"] = df["macd"].ewm(span=9, adjust=False).mean()
@@ -364,6 +370,120 @@ def draw_day_marks(axp, others, d, bn):
                              color=txt, ha="center", va="bottom", fontweight="bold")
 
 
+# ---------------- 새 모양: 지지·저항 박스, 일목 구름, 하이킨아시, 과매도/과매수 ----------------
+def make_zones(pts, price, above):
+    """비슷한 가격의 고/저점을 묶어 박스로 만듦. 현재가 위(저항)/아래(지지) 가까운 2개만"""
+    groups = []
+    for _, p in sorted(pts, key=lambda t: t[1]):
+        if groups and p <= groups[-1][0] * (1 + ZONE_PCT):
+            groups[-1][1].append(p)
+            groups[-1][0] = p
+        else:
+            groups.append([p, [p]])
+    zs = [(min(g[1]), max(g[1])) for g in groups]
+    if above:
+        zs = [z for z in zs if z[0] > price]
+        zs.sort(key=lambda z: z[0])
+    else:
+        zs = [z for z in zs if z[1] < price]
+        zs.sort(key=lambda z: -z[1])
+    return zs[:2]
+
+
+def mid_hl(H, L, i, n):
+    """i번째 봉까지 n봉의 (최고가+최저가)/2"""
+    a = max(0, i - n + 1)
+    return (H[a:i + 1].max() + L[a:i + 1].min()) / 2
+
+
+def draw_cloud(ax, H, L, n):
+    """일목 구름: 선행스팬A=(전환선9+기준선26)/2, 선행스팬B=52봉 중간값. 26봉 앞으로 밀어서 그림.
+    파랑 구름 = A가 위(상승 구름) / 주황 구름 = B가 위(하락 구름)"""
+    total = len(H)
+    first = total - n
+    xs, a_vals, b_vals = [], [], []
+    for j in range(n + SHIFT):
+        src = first + j - SHIFT
+        if src < 51 or src > total - 1:
+            continue
+        a_vals.append((mid_hl(H, L, src, 9) + mid_hl(H, L, src, 26)) / 2)
+        b_vals.append(mid_hl(H, L, src, 52))
+        xs.append(j)
+    if len(xs) < 2:
+        return
+    ax.fill_between(xs, a_vals, b_vals, where=[a >= b for a, b in zip(a_vals, b_vals)],
+                    color="#42a5f5", alpha=0.16, linewidth=0, interpolate=True, zorder=0)
+    ax.fill_between(xs, a_vals, b_vals, where=[a < b for a, b in zip(a_vals, b_vals)],
+                    color="#ffa726", alpha=0.18, linewidth=0, interpolate=True, zorder=0)
+
+
+def heikin_all(df):
+    """하이킨아시 캔들: 종가=(시+고+저+종)/4, 시가=앞 하이킨아시 봉의 (시+종)/2"""
+    o, h, l, c = df["o"].values, df["h"].values, df["l"].values, df["c"].values
+    out = []
+    for i in range(len(df)):
+        hc = (o[i] + h[i] + l[i] + c[i]) / 4
+        ho = (o[i] + c[i]) / 2 if i == 0 else (out[-1][0] + out[-1][3]) / 2
+        out.append((ho, max(h[i], ho, hc), min(l[i], ho, hc), hc))
+    return out
+
+
+def draw_ha(axh, df, n):
+    """가격 차트 바로 아래 작은 칸에 하이킨아시 캔들을 그림"""
+    up, down = "#2e9e44", "#d62728"
+    for i, (o, h, l, c) in enumerate(heikin_all(df)[-n:]):
+        col = up if c >= o else down
+        axh.vlines(i, l, h, color=col, linewidth=0.8)
+        axh.bar(i, abs(c - o) or (h - l) * 0.01, bottom=min(o, c), color=col, width=0.7)
+
+
+def draw_zones(axp, df, d):
+    """가격 차트에 지지(초록)·저항(빨강) 박스, 일목 구름, 과매도▲/과매수▼, 정배열/역배열 글자를 얹음
+    (진입·손절·익절 선과 노란 추세선은 그대로)"""
+    n = len(d)
+    y0, y1 = axp.get_ylim()
+    hv, lv = d["h"].values, d["l"].values
+    price = float(d["c"].iloc[-1])
+    hi, lo = [], []
+    for i in range(ZPIVOT, n - ZPIVOT):
+        if hv[i] >= hv[i - ZPIVOT:i + ZPIVOT + 1].max():
+            hi.append((i, hv[i]))
+        if lv[i] <= lv[i - ZPIVOT:i + ZPIVOT + 1].min():
+            lo.append((i, lv[i]))
+    for zl, zh in make_zones(lo, price, False):
+        axp.axhspan(zl * 0.997, zh * 1.003, color="#2e7d32", alpha=0.18, zorder=0)
+    for zl, zh in make_zones(hi, price, True):
+        axp.axhspan(zl * 0.997, zh * 1.003, color="#c62828", alpha=0.18, zorder=0)
+    gap = (y1 - y0) * 0.025
+    r = d["rsi14"].values
+    lx, ly, hx, hy = [], [], [], []
+    for i in range(n):
+        if pd.isna(r[i]):
+            continue
+        if r[i] <= RSI_LOW:
+            lx.append(i)
+            ly.append(lv[i] - gap)
+        elif r[i] >= RSI_HIGH:
+            hx.append(i)
+            hy.append(hv[i] + gap)
+    if lx:
+        axp.scatter(lx, ly, marker="^", s=28, color="#1565c0", zorder=5)
+    if hx:
+        axp.scatter(hx, hy, marker="v", s=28, color="#d50000", zorder=5)
+    draw_cloud(axp, df["h"].values, df["l"].values, n)
+    last = d.iloc[-1]
+    if last["ema20"] > last["ema50"] > last["ema120"]:
+        txt, col = "정배열 ▲", "#2e7d32"
+    elif last["ema20"] < last["ema50"] < last["ema120"]:
+        txt, col = "역배열 ▼", "#c62828"
+    else:
+        txt, col = "혼조 ─", "#555555"
+    axp.text(0.99, 0.97, txt, transform=axp.transAxes, ha="right", va="top", fontsize=11,
+             fontweight="bold", color=col)
+    axp.set_ylim(y0, y1)                       # 박스·구름 때문에 차트 크기가 안 바뀌게 고정
+    axp.set_xlim(-1, n + SHIFT + 2)            # 구름이 앞으로 나가는 만큼 오른쪽 여백
+
+
 def draw_card(dfs, sig, pl, side, primary, title, path):
     """일봉·4시간·1시간·15분을 한 장(2x2)에 그림. 신호난 선은 굵게, 진입·손절·익절은 신호난 봉 칸에만."""
     from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec
@@ -371,12 +491,13 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
     outer = GridSpec(2, 2, figure=fig, wspace=0.14, hspace=0.12, top=0.94, bottom=0.03, left=0.06, right=0.97)
     fig.suptitle(title, fontsize=16, x=0.06, ha="left", color="#2e7d32" if side == "L" else "#c62828")
     for k, (bar, bn) in enumerate(BARS):
-        gs = GridSpecFromSubplotSpec(4, 1, subplot_spec=outer[k // 2, k % 2],
-                                     height_ratios=[4, 1.2, 1.2, 1.2], hspace=0.08)
+        gs = GridSpecFromSubplotSpec(5, 1, subplot_spec=outer[k // 2, k % 2],
+                                     height_ratios=[5.2, 1.0, 0.9, 0.9, 0.9], hspace=0.08)
         axp = fig.add_subplot(gs[0])
-        axr = fig.add_subplot(gs[1], sharex=axp)
-        axm = fig.add_subplot(gs[2], sharex=axp)
-        axv = fig.add_subplot(gs[3], sharex=axp)
+        axh = fig.add_subplot(gs[1], sharex=axp)     # 하이킨아시 작은 칸
+        axr = fig.add_subplot(gs[2], sharex=axp)
+        axm = fig.add_subplot(gs[3], sharex=axp)
+        axv = fig.add_subplot(gs[4], sharex=axp)
         df = dfs.get(bar)
         if df is None:
             axp.set_title(f"{bn} (데이터 없음)", fontsize=11, loc="left")
@@ -398,7 +519,9 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
         draw_trendlines(axp, d)
         axp.set_ylim(y_lo, y_hi)
         axp.set_xlim(-1, len(d) + TREND_EXT)
-        draw_day_marks(axp, [axr, axm, axv], d, bn)
+        draw_zones(axp, df, d)                       # 새 모양: 박스·구름·▲▼·배열 글자
+        draw_ha(axh, df, len(d))
+        draw_day_marks(axp, [axh, axr, axm, axv], d, bn)
         mark = "  ★ " + "+".join(names) if names else ""
         axp.set_title(f"{bn} ({bar}){mark}", fontsize=11, loc="left", fontweight="bold" if names else "normal")
         if names:
@@ -419,15 +542,15 @@ def draw_card(dfs, sig, pl, side, primary, title, path):
         axm.plot(x, d["macd"], color="#1e88e5", lw=0.8)
         axm.plot(x, d["sig"], color="#fb8c00", lw=0.8)
         axv.bar(x, d["turn"], color=col, width=0.7)
-        for ax, lab in ((axr, "RSI"), (axm, "MACD"), (axv, "VOL")):
+        for ax, lab in ((axh, "HA"), (axr, "RSI"), (axm, "MACD"), (axv, "VOL")):
             ax.set_ylabel(lab, fontsize=7)
             ax.tick_params(labelsize=7)
         axp.tick_params(labelsize=8)
         axv.set_yticks([])
-        for ax in (axp, axr, axm):
+        for ax in (axp, axh, axr, axm):
             plt.setp(ax.get_xticklabels(), visible=False)
         axv.set_xticks([])
-        for ax in (axp, axr, axm, axv):
+        for ax in (axp, axh, axr, axm, axv):
             ax.grid(alpha=0.25)
     fig.savefig(path)
     plt.close(fig)
