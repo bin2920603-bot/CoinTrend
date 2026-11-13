@@ -33,6 +33,7 @@ jobs:
           START=$SECONDS
           while [ $((SECONDS - START)) -lt 20000 ]; do
             python trend_alert.py || echo "실행 실패"
+            python touch_alert.py || echo "추세선 알림 실패"
             git add state.json || true
             git diff --cached --quiet || (git commit -m "state" && git pull --rebase --autostash && git push) || true
             sleep 600
